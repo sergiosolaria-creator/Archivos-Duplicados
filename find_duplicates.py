@@ -22,6 +22,7 @@ CHUNK_SIZE = 8 * 1024 * 1024
 #    ".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v", ".3gp",
 #    ".mpeg", ".mpg", ".mts", ".m2ts",
 #}
+
 IMAGE_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".bmp",
 }
