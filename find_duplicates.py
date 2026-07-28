@@ -15,12 +15,18 @@ from PIL import Image
 DEFAULT_MOVE_DESTINATION = "/Volumes/Externo/FotosDuplicadas"
 CHUNK_SIZE = 8 * 1024 * 1024
 
-IMAGE_EXTENSIONS = {
-    ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".gif", ".webp", ".heic",
+#IMAGE_EXTENSIONS = {
+#    ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".gif", ".webp", ".heic",
+#}
+#VIDEO_EXTENSIONS = {
+#    ".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v", ".3gp",
+#    ".mpeg", ".mpg", ".mts", ".m2ts",
+#}
+* IMAGE_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".bmp",
 }
 VIDEO_EXTENSIONS = {
-    ".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v", ".3gp",
-    ".mpeg", ".mpg", ".mts", ".m2ts",
+    ".mp4", ".mov",
 }
 MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 
