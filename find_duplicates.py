@@ -261,25 +261,19 @@ def unique_destination_path(destination_dir, source_path):
         counter += 1
 
 
-def write_moved_manifest(move_destination, moved):
-    """Registra en la carpeta destino el path de origen de cada archivo movido.
+def open_manifest(move_destination):
+    """Abre (o crea) el manifiesto CSV en la carpeta destino para escritura incremental.
 
-    El manifiesto es un CSV acumulativo (se añaden filas en ejecuciones sucesivas)
-    con: fecha, path de origen y path final dentro de la carpeta de duplicados.
+    Devuelve (handle, writer, path). Escribe la cabecera si el archivo es nuevo.
     """
     manifest_path = os.path.join(move_destination, MANIFEST_FILENAME)
     is_new = not os.path.exists(manifest_path)
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    with open(manifest_path, "a", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        if is_new:
-            writer.writerow(["fecha", "origen", "destino"])
-        for source, destination in moved:
-            writer.writerow([timestamp, source, destination])
-
-    logger.info(f"Manifiesto de orígenes actualizado ({len(moved)} entradas): {manifest_path}")
-    return manifest_path
+    handle = open(manifest_path, "a", newline="", encoding="utf-8")
+    writer = csv.writer(handle)
+    if is_new:
+        writer.writerow(["fecha", "origen", "destino"])
+        handle.flush()
+    return handle, writer, manifest_path
 
 
 def move_duplicate_files(groups, move_destination, dry_run=False):
@@ -290,47 +284,59 @@ def move_duplicate_files(groups, move_destination, dry_run=False):
     skipped = []
     errors = []
 
+    # Registro incremental: se abre el manifiesto y se escribe (con flush) cada
+    # archivo justo tras moverlo, de modo que una interrupción no borra el avance.
+    manifest_handle = manifest_writer = manifest_path = None
+    if not dry_run:
+        manifest_handle, manifest_writer, manifest_path = open_manifest(move_destination)
+        logger.info(f"Manifiesto incremental: {manifest_path}")
+
     skipped_empty = 0
-    for group in groups:
-        # Resguardo: no mover grupos que no liberan espacio (p.ej. archivos de 0
-        # bytes, que comparten el mismo MD5 sin ser duplicados reales).
-        if group.get("wasted_bytes", 1) == 0:
-            skipped_empty += 1
-            logger.debug(
-                f"Grupo omitido (0 bytes recuperables, {group['count']} archivos): {group['key']}"
-            )
-            continue
-
-        keep = choose_file_to_keep(group["records"], move_destination)
-        logger.debug(f"Conservando (primera copia): {keep['path']} (MD5: {group['key']})")
-        for record in group["records"]:
-            source = record["path"]
-            if source == keep["path"]:
+    try:
+        for group in groups:
+            # Resguardo: no mover grupos que no liberan espacio (p.ej. archivos de
+            # 0 bytes, que comparten el mismo MD5 sin ser duplicados reales).
+            if group.get("wasted_bytes", 1) == 0:
+                skipped_empty += 1
+                logger.debug(
+                    f"Grupo omitido (0 bytes recuperables, {group['count']} archivos): {group['key']}"
+                )
                 continue
 
-            destination = unique_destination_path(move_destination, source)
-            if dry_run:
-                logger.debug(f"[SIMULACIÓN] Se movería: {source} -> {destination}")
-                moved.append((source, destination))
-                continue
+            keep = choose_file_to_keep(group["records"], move_destination)
+            logger.debug(f"Conservando (primera copia): {keep['path']} (MD5: {group['key']})")
+            for record in group["records"]:
+                source = record["path"]
+                if source == keep["path"]:
+                    continue
 
-            try:
-                shutil.move(source, destination)
-                logger.debug(f"Movido: {source} -> {destination}")
-                moved.append((source, destination))
-            except Exception as exc:
-                logger.error(f"Error moviendo {source}: {exc}")
-                errors.append((source, str(exc)))
+                destination = unique_destination_path(move_destination, source)
+                if dry_run:
+                    logger.debug(f"[SIMULACIÓN] Se movería: {source} -> {destination}")
+                    moved.append((source, destination))
+                    continue
+
+                try:
+                    shutil.move(source, destination)
+                    logger.debug(f"Movido: {source} -> {destination}")
+                    moved.append((source, destination))
+                    # Escritura inmediata en el manifiesto + flush a disco.
+                    manifest_writer.writerow(
+                        [datetime.now().strftime("%Y-%m-%d %H:%M:%S"), source, destination]
+                    )
+                    manifest_handle.flush()
+                except Exception as exc:
+                    logger.error(f"Error moviendo {source}: {exc}")
+                    errors.append((source, str(exc)))
+    finally:
+        if manifest_handle:
+            manifest_handle.close()
 
     if skipped_empty:
         logger.info(f"Grupos omitidos por 0 bytes recuperables: {skipped_empty}")
 
-    # Solo se escribe el manifiesto cuando hubo movimientos reales.
-    manifest_path = None
-    if moved and not dry_run:
-        manifest_path = write_moved_manifest(move_destination, moved)
-
-    return moved, skipped, errors, manifest_path
+    written_manifest = manifest_path if (moved and not dry_run) else None
+    return moved, skipped, errors, written_manifest
 
 
 LOG_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \[[A-Z]+\] ?")
