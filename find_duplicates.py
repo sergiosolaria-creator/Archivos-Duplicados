@@ -4,8 +4,10 @@
 import argparse
 import csv
 import hashlib
+import json
 import logging
 import os
+import re
 import shutil
 import sys
 import time
@@ -169,12 +171,16 @@ def group_by_key(records, key):
     duplicate_groups = []
     for key_value, members in groups.items():
         if len(members) > 1:
-            duplicate_groups.append({
+            group = {
                 "key": key_value,
                 "files": [member["path"] for member in members],
                 "records": members,
                 "count": len(members),
-            })
+            }
+            # Bytes recuperables si todos los miembros tienen tamaño conocido.
+            if all(member.get("file_size") is not None for member in members):
+                group["wasted_bytes"] = wasted_bytes_for_exact_group(group)
+            duplicate_groups.append(group)
 
     duplicate_groups.sort(key=lambda group: (-group["count"], group["files"][0]))
     return duplicate_groups
@@ -255,62 +261,142 @@ def unique_destination_path(destination_dir, source_path):
         counter += 1
 
 
-def write_moved_manifest(move_destination, moved):
-    """Registra en la carpeta destino el path de origen de cada archivo movido.
+def open_manifest(move_destination):
+    """Abre (o crea) el manifiesto CSV en la carpeta destino para escritura incremental.
 
-    El manifiesto es un CSV acumulativo (se añaden filas en ejecuciones sucesivas)
-    con: fecha, path de origen y path final dentro de la carpeta de duplicados.
+    Devuelve (handle, writer, path). Escribe la cabecera si el archivo es nuevo.
     """
     manifest_path = os.path.join(move_destination, MANIFEST_FILENAME)
     is_new = not os.path.exists(manifest_path)
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    with open(manifest_path, "a", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        if is_new:
-            writer.writerow(["fecha", "origen", "destino"])
-        for source, destination in moved:
-            writer.writerow([timestamp, source, destination])
-
-    logger.info(f"Manifiesto de orígenes actualizado ({len(moved)} entradas): {manifest_path}")
-    return manifest_path
+    handle = open(manifest_path, "a", newline="", encoding="utf-8")
+    writer = csv.writer(handle)
+    if is_new:
+        writer.writerow(["fecha", "origen", "destino"])
+        handle.flush()
+    return handle, writer, manifest_path
 
 
 def move_duplicate_files(groups, move_destination, dry_run=False):
-    os.makedirs(move_destination, exist_ok=True)
+    if not dry_run:
+        os.makedirs(move_destination, exist_ok=True)
 
     moved = []
     skipped = []
     errors = []
 
+    # Registro incremental: se abre el manifiesto y se escribe (con flush) cada
+    # archivo justo tras moverlo, de modo que una interrupción no borra el avance.
+    manifest_handle = manifest_writer = manifest_path = None
+    if not dry_run:
+        manifest_handle, manifest_writer, manifest_path = open_manifest(move_destination)
+        logger.info(f"Manifiesto incremental: {manifest_path}")
+
+    skipped_empty = 0
+    try:
+        for group in groups:
+            # Resguardo: no mover grupos que no liberan espacio (p.ej. archivos de
+            # 0 bytes, que comparten el mismo MD5 sin ser duplicados reales).
+            if group.get("wasted_bytes", 1) == 0:
+                skipped_empty += 1
+                logger.debug(
+                    f"Grupo omitido (0 bytes recuperables, {group['count']} archivos): {group['key']}"
+                )
+                continue
+
+            keep = choose_file_to_keep(group["records"], move_destination)
+            logger.debug(f"Conservando (primera copia): {keep['path']} (MD5: {group['key']})")
+            for record in group["records"]:
+                source = record["path"]
+                if source == keep["path"]:
+                    continue
+
+                destination = unique_destination_path(move_destination, source)
+                if dry_run:
+                    logger.debug(f"[SIMULACIÓN] Se movería: {source} -> {destination}")
+                    moved.append((source, destination))
+                    continue
+
+                try:
+                    shutil.move(source, destination)
+                    logger.debug(f"Movido: {source} -> {destination}")
+                    moved.append((source, destination))
+                    # Escritura inmediata en el manifiesto + flush a disco.
+                    manifest_writer.writerow(
+                        [datetime.now().strftime("%Y-%m-%d %H:%M:%S"), source, destination]
+                    )
+                    manifest_handle.flush()
+                except Exception as exc:
+                    logger.error(f"Error moviendo {source}: {exc}")
+                    errors.append((source, str(exc)))
+    finally:
+        if manifest_handle:
+            manifest_handle.close()
+
+    if skipped_empty:
+        logger.info(f"Grupos omitidos por 0 bytes recuperables: {skipped_empty}")
+
+    written_manifest = manifest_path if (moved and not dry_run) else None
+    return moved, skipped, errors, written_manifest
+
+
+LOG_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \[[A-Z]+\] ?")
+GROUP_HEADER_RE = re.compile(r"^Grupo \d+ \| MD5: (\S+) \| (\S+) \| Archivos: (\d+)")
+WASTED_RE = re.compile(r"^Espacio recuperable: ([\d.]+) (\w+)")
+UNIT_FACTORS = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}
+
+
+def parse_bytes(value, unit):
+    return int(float(value) * UNIT_FACTORS.get(unit.upper(), 1))
+
+
+def parse_exact_groups_from_log(log_path):
+    """Reconstruye los grupos de duplicados exactos desde un log previo.
+
+    Permite mover los duplicados sin volver a analizar (re-hashear) los archivos.
+    Solo se lee la sección de DUPLICADOS EXACTOS.
+    """
+    groups = []
+    current = None
+    in_exact = False
+
+    with open(log_path, encoding="utf-8") as handle:
+        for raw in handle:
+            content = LOG_PREFIX_RE.sub("", raw.rstrip("\n"))
+
+            if "=== DUPLICADOS EXACTOS" in content:
+                in_exact = True
+                continue
+            if "=== DUPLICADOS VISUALES" in content:
+                if current:
+                    groups.append(current)
+                    current = None
+                break
+            if not in_exact:
+                continue
+
+            header = GROUP_HEADER_RE.match(content)
+            if header:
+                if current:
+                    groups.append(current)
+                current = {"key": header.group(1), "files": [], "wasted_bytes": None}
+                continue
+
+            wasted = WASTED_RE.match(content)
+            if wasted and current is not None:
+                current["wasted_bytes"] = parse_bytes(wasted.group(1), wasted.group(2))
+                continue
+
+            if content.startswith("  - ") and current is not None:
+                current["files"].append(content[4:])
+
+    if current:
+        groups.append(current)
+
     for group in groups:
-        keep = choose_file_to_keep(group["records"], move_destination)
-        logger.debug(f"Conservando (primera copia): {keep['path']} (MD5: {group['key']})")
-        for record in group["records"]:
-            source = record["path"]
-            if source == keep["path"]:
-                continue
+        group["records"] = [{"path": path} for path in group["files"]]
+        group["count"] = len(group["files"])
 
-            destination = unique_destination_path(move_destination, source)
-            if dry_run:
-                logger.debug(f"[SIMULACIÓN] Se movería: {source} -> {destination}")
-                moved.append((source, destination))
-                continue
-
-            try:
-                shutil.move(source, destination)
-                logger.debug(f"Movido: {source} -> {destination}")
-                moved.append((source, destination))
-            except Exception as exc:
-                logger.error(f"Error moviendo {source}: {exc}")
-                errors.append((source, str(exc)))
-
-    # Solo se escribe el manifiesto cuando hubo movimientos reales.
-    manifest_path = None
-    if moved and not dry_run:
-        manifest_path = write_moved_manifest(move_destination, moved)
-
-    return moved, skipped, errors, manifest_path
+    return groups
 
 
 def print_exact_duplicates(groups):
@@ -372,7 +458,58 @@ def print_visual_duplicates(groups):
     logger.info(f"\nResumen visuales: {len(groups)} grupos detectados.")
 
 
-def find_duplicate_media(folder_path, excluded_roots=()):
+def load_cache(cache_file):
+    """Carga la caché de análisis previa (si existe)."""
+    if not cache_file or not os.path.exists(cache_file):
+        return {}
+    try:
+        with open(cache_file, encoding="utf-8") as handle:
+            data = json.load(handle)
+        logger.info(f"Caché cargada: {len(data)} archivos ya analizados en {cache_file}")
+        return data
+    except Exception as exc:
+        logger.warning(f"No se pudo leer la caché {cache_file}: {exc}")
+        return {}
+
+
+def save_cache(cache_file, cache):
+    """Guarda la caché de forma atómica (escribe a .tmp y renombra)."""
+    if not cache_file:
+        return
+    tmp = cache_file + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(cache, handle)
+        os.replace(tmp, cache_file)
+    except Exception as exc:
+        logger.warning(f"No se pudo guardar la caché {cache_file}: {exc}")
+
+
+def record_from_cache(file_path, entry, size):
+    dims = entry.get("dimensions")
+    return {
+        "path": file_path,
+        "media_type": entry["media_type"],
+        "exact_hash": entry["exact_hash"],
+        "perceptual_hash": entry.get("perceptual_hash"),
+        "dimensions": tuple(dims) if dims else None,
+        "file_size": size,
+    }
+
+
+def cache_entry_from_record(record, mtime):
+    dims = record["dimensions"]
+    return {
+        "size": record["file_size"],
+        "mtime": mtime,
+        "media_type": record["media_type"],
+        "exact_hash": record["exact_hash"],
+        "perceptual_hash": record["perceptual_hash"],
+        "dimensions": list(dims) if dims else None,
+    }
+
+
+def find_duplicate_media(folder_path, excluded_roots=(), cache_file=None):
     records = []
     logger.info("Buscando archivos de fotos y videos...")
     # Orden alfabético estable: "la primera copia encontrada" es determinista.
@@ -383,19 +520,43 @@ def find_duplicate_media(folder_path, excluded_roots=()):
     if total == 0:
         return [], [], 0, 0
 
+    cache = load_cache(cache_file)
+    cache_hits = 0
     failed = 0
     for index, file_path in enumerate(media_paths, start=1):
         # Contador en vivo en consola (se reescribe en la misma línea).
         sys.stdout.write(f"Analizando [{index}/{total}]: {file_path[:80]}\r")
         sys.stdout.flush()
         logger.debug(f"Analizando [{index}/{total}]: {file_path}")
-        record = analyze_media(file_path)
+
+        record = None
+        try:
+            st = os.stat(file_path)
+            key = os.path.abspath(file_path)
+            entry = cache.get(key)
+            if entry and entry.get("size") == st.st_size and entry.get("mtime") == int(st.st_mtime):
+                record = record_from_cache(file_path, entry, st.st_size)
+                cache_hits += 1
+            else:
+                record = analyze_media(file_path)
+                if record:
+                    cache[key] = cache_entry_from_record(record, int(st.st_mtime))
+        except OSError as exc:
+            logger.error(f"Error accediendo {file_path}: {exc}")
+
         if record:
             records.append(record)
         else:
             failed += 1
 
+        # Guardado periódico para no perder el trabajo si se interrumpe.
+        if cache_file and index % 2000 == 0:
+            save_cache(cache_file, cache)
+
+    save_cache(cache_file, cache)
     sys.stdout.write("\r" + " " * 100 + "\r")  # limpia la línea del contador
+    if cache_file:
+        logger.info(f"Reutilizados de caché: {cache_hits} | Analizados de nuevo: {total - cache_hits}")
     images = sum(1 for record in records if record["media_type"] == "image")
     videos = sum(1 for record in records if record["media_type"] == "video")
     logger.info(
@@ -441,6 +602,24 @@ def parse_args():
         default=None,
         help="Ruta del archivo de log (default: duplicados_AAAAMMDD_HHMMSS.log en el directorio actual)",
     )
+    parser.add_argument(
+        "--cache-file",
+        default="find_duplicates_cache.json",
+        help="Archivo de caché de hashes para acelerar re-ejecuciones "
+             "(default: find_duplicates_cache.json)",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Desactiva la caché de hashes",
+    )
+    parser.add_argument(
+        "--from-log",
+        default=None,
+        metavar="LOG",
+        help="Mueve los duplicados exactos leyéndolos de un log previo, SIN volver "
+             "a analizar. Requiere --move (o --dry-run). Se omiten grupos de 0 bytes.",
+    )
     return parser.parse_args()
 
 
@@ -474,6 +653,71 @@ def print_final_summary(stats):
     logger.info("=" * 60)
 
 
+def report_moves(moved, errors, move_destination, dry_run):
+    """Registra el detalle de los archivos movidos."""
+    logger.info("\n=== MOVIMIENTO DE DUPLICADOS EXACTOS ===")
+    if not moved:
+        logger.info("No había duplicados exactos para mover.")
+    else:
+        action = "Se moverían" if dry_run else "Movidos"
+        logger.info(f"{action} {len(moved)} archivos a {move_destination}")
+        for source, destination in moved[:20]:
+            logger.info(f"  {source}\n    -> {destination}")
+        if len(moved) > 20:
+            logger.info(f"  ... y {len(moved) - 20} archivos más")
+
+    if errors:
+        logger.info(f"\nErrores al mover {len(errors)} archivos:")
+        for source, message in errors[:20]:
+            logger.info(f"  - {source}: {message}")
+
+
+def run_from_log(args, log_file, start_time):
+    """Mueve duplicados a partir de un log previo, sin re-analizar archivos."""
+    move_destination = os.path.abspath(args.move_destination)
+
+    if not os.path.isfile(args.from_log):
+        logger.error(f"No existe el log indicado: {args.from_log}")
+        sys.exit(1)
+    if not args.move and not args.dry_run:
+        logger.error("--from-log requiere --move (o --dry-run para simular).")
+        sys.exit(1)
+    if args.move and not args.dry_run and not os.path.isdir(os.path.dirname(move_destination)):
+        logger.error(f"No se puede acceder al volumen destino: {move_destination}")
+        sys.exit(1)
+
+    logger.info(f"Log de esta ejecución: {log_file}")
+    logger.info(f"Reconstruyendo duplicados desde: {args.from_log} (sin re-analizar)")
+    groups = parse_exact_groups_from_log(args.from_log)
+    total_files = sum(len(group["files"]) for group in groups)
+    logger.info(f"Grupos leídos: {len(groups)} | Archivos listados: {total_files}")
+
+    mode = "simulación" if args.dry_run else "movimiento real"
+    logger.info(f"Modo {mode}: duplicados exactos -> {move_destination}")
+
+    moved, skipped, errors, manifest_path = move_duplicate_files(
+        groups, move_destination, dry_run=args.dry_run
+    )
+    report_moves(moved, errors, move_destination, args.dry_run)
+
+    print_final_summary({
+        "folder": f"(desde log) {args.from_log}",
+        "discovered": total_files,
+        "processed": total_files,
+        "exact_groups": len(groups),
+        "redundant_files": sum(max(len(g["files"]) - 1, 0) for g in groups),
+        "wasted": sum(g.get("wasted_bytes") or 0 for g in groups),
+        "visual_groups": 0,
+        "mode": mode,
+        "moved": len(moved),
+        "move_errors": len(errors),
+        "move_destination": move_destination,
+        "manifest": manifest_path,
+        "elapsed": time.time() - start_time,
+        "log_file": log_file,
+    })
+
+
 def main():
     args = parse_args()
 
@@ -483,6 +727,11 @@ def main():
     setup_logging(log_file)
     start_time = time.time()
 
+    # Modo especial: mover a partir de un log previo, sin re-analizar.
+    if args.from_log:
+        run_from_log(args, log_file, start_time)
+        return
+
     folder_path = args.folder or input("Introduce la ruta de la carpeta con fotos/videos: ").strip()
 
     if not folder_path:
@@ -491,6 +740,7 @@ def main():
 
     folder_path = os.path.abspath(folder_path)
     move_destination = os.path.abspath(args.move_destination)
+    cache_file = None if args.no_cache else args.cache_file
 
     if not os.path.isdir(folder_path):
         logger.error(f"La ruta no existe o no es una carpeta: {folder_path}")
@@ -511,6 +761,7 @@ def main():
     exact_duplicates, visual_duplicates, processed, discovered = find_duplicate_media(
         folder_path,
         excluded_roots=excluded_roots,
+        cache_file=cache_file,
     )
 
     logger.info(f"\nArchivos encontrados: {discovered} | Analizados correctamente: {processed}")
@@ -530,22 +781,7 @@ def main():
         )
         moved_count = len(moved)
         move_errors = len(errors)
-
-        logger.info("\n=== MOVIMIENTO DE DUPLICADOS EXACTOS ===")
-        if not moved:
-            logger.info("No había duplicados exactos para mover.")
-        else:
-            action = "Se moverían" if args.dry_run else "Movidos"
-            logger.info(f"{action} {len(moved)} archivos a {move_destination}")
-            for source, destination in moved[:20]:
-                logger.info(f"  {source}\n    -> {destination}")
-            if len(moved) > 20:
-                logger.info(f"  ... y {len(moved) - 20} archivos más")
-
-        if errors:
-            logger.info(f"\nErrores al mover {len(errors)} archivos:")
-            for source, message in errors[:20]:
-                logger.info(f"  - {source}: {message}")
+        report_moves(moved, errors, move_destination, args.dry_run)
 
     print_final_summary({
         "folder": folder_path,
